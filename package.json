@@ -7,11 +7,11 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/biklabs/agent-runner.git"
+    "url": "https://github.com/mynameisshineee/agent-runner.git"
   },
-  "homepage": "https://github.com/biklabs/agent-runner",
+  "homepage": "https://github.com/mynameisshineee/agent-runner",
   "bugs": {
-    "url": "https://github.com/biklabs/agent-runner/issues"
+    "url": "https://github.com/mynameisshineee/agent-runner/issues"
   },
   "engines": {
     "bun": ">=1.2.0"
