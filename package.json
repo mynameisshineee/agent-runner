@@ -27,6 +27,7 @@
     "dispatch.ts",
     "jobs.ts",
     "session-client.ts",
+    "validate.ts",
     "agents.json",
     "README.md",
     "QUALITY_GATES.md",
@@ -39,7 +40,8 @@
     "runner": "bun run ./runner.ts",
     "dispatch": "bun run ./dispatch.ts",
     "jobs": "bun run ./jobs.ts",
-    "session": "bun run ./session-client.ts"
+    "session": "bun run ./session-client.ts",
+    "check": "bun run ./validate.ts"
   },
   "keywords": [
     "biklabs",

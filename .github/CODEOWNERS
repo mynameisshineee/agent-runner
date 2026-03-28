@@ -1,0 +1,9 @@
+# Default owners
+* @mynameisshineee
+
+# Security-sensitive runtime and orchestration
+runner.ts @mynameisshineee
+session-client.ts @mynameisshineee
+dispatch.ts @mynameisshineee
+agents.json @mynameisshineee
+.github/workflows/* @mynameisshineee
