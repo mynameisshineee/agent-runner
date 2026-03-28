@@ -26,6 +26,7 @@ import type { ChildProcess } from "node:child_process";
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Database } from "bun:sqlite";
+import { printBiklabsBanner } from "./banner";
 
 declare const Bun: {
   serve: (config: {
@@ -1732,6 +1733,7 @@ const server = Bun.serve({
   },
 });
 
+printBiklabsBanner("Agent Runner — Durable Queue");
 console.log(`
 ╔══════════════════════════════════════════════════╗
 ║ BIKLabs Agent Runner — Durable Queue (Fase 1)   ║

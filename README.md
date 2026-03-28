@@ -60,6 +60,7 @@ export MAX_ATTEMPTS_DEFAULT="3" # opcional
 export MAX_QUEUE_DEPTH_PER_AGENT="20" # opcional
 export RUNNER_EXECUTION_MODE="spawn" # spawn|terminal
 export SESSION_TTL_MS="30000" # solo terminal mode
+export BIKLABS_NO_BANNER="0" # opcional (1 para ocultar ASCII banner)
 ```
 
 ### 3. Arrancar el runner

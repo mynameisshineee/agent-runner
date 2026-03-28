@@ -27,6 +27,7 @@
     "dispatch.ts",
     "jobs.ts",
     "session-client.ts",
+    "banner.ts",
     "agents.json",
     "README.md",
     "QUALITY_GATES.md",

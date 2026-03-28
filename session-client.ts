@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { printBiklabsBanner } from "./banner";
 
 type RuntimeType = "claude_code" | "codex" | "opencode" | "kiro" | "chat";
 
@@ -275,6 +276,7 @@ async function claimLoop(): Promise<void> {
   }
 }
 
+printBiklabsBanner(`Agent Session — ${AGENT_ID}`);
 console.log(`[agent-session] starting session=${SESSION_ID} agent=${AGENT_ID} runner=${RUNNER_URL}`);
 void heartbeatLoop();
 await claimLoop();
