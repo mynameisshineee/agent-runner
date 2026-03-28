@@ -1,0 +1,54 @@
+{
+  "name": "@biklabs/agent-runner",
+  "version": "0.1.0",
+  "private": false,
+  "description": "BIKLabs terminal-first multi-runtime agent orchestrator (Claude Code, Codex, OpenCode, Kiro)",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/biklabs/agent-runner.git"
+  },
+  "homepage": "https://github.com/biklabs/agent-runner",
+  "bugs": {
+    "url": "https://github.com/biklabs/agent-runner/issues"
+  },
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "bin": {
+    "biklabs-agent-runner": "./runner.ts",
+    "biklabs-agent-dispatch": "./dispatch.ts",
+    "biklabs-agent-jobs": "./jobs.ts",
+    "biklabs-agent-session": "./session-client.ts"
+  },
+  "files": [
+    "runner.ts",
+    "dispatch.ts",
+    "jobs.ts",
+    "session-client.ts",
+    "agents.json",
+    "README.md",
+    "RUNTIME_PROFILES.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "runner": "bun run ./runner.ts",
+    "dispatch": "bun run ./dispatch.ts",
+    "jobs": "bun run ./jobs.ts",
+    "session": "bun run ./session-client.ts"
+  },
+  "keywords": [
+    "biklabs",
+    "agent",
+    "orchestrator",
+    "mcp",
+    "claude-code",
+    "codex",
+    "opencode",
+    "kiro",
+    "terminal-first"
+  ]
+}

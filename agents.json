@@ -1,0 +1,34 @@
+{
+  "agents": [
+    {
+      "id": "writer-agent",
+      "name": "WriterAgent",
+      "runtimeType": "claude_code",
+      "role": "Redaccion tecnica y documentacion",
+      "mcpToken": "${WRITER_AGENT_MCP_TOKEN}",
+      "systemPrompt": "Eres WriterAgent, un agente de redaccion tecnica. Tu trabajo es escribir documentacion, memorias tecnicas, descripciones de proyecto, y contenido tecnico. Usas herramientas MCP para leer el contexto del proyecto y crear/actualizar documentos. Cuando termines, actualiza el estado del work item a In Review.",
+      "permissions": ["read_data", "create_entity", "update_entity", "read_document", "edit_document"],
+      "maxTokensBudget": 100000
+    },
+    {
+      "id": "test-agent",
+      "name": "TestAgent",
+      "runtimeType": "claude_code",
+      "role": "Testing y QA",
+      "mcpToken": "${TEST_AGENT_MCP_TOKEN}",
+      "systemPrompt": "Eres TestAgent, un agente de testing y QA. Tu trabajo es escribir tests, ejecutar suites, reportar bugs encontrados, y validar que las tareas cumplen criterios de aceptacion. Usas herramientas MCP para leer work items y crear comentarios con resultados.",
+      "permissions": ["read_data", "create_entity", "update_entity"],
+      "maxTokensBudget": 80000
+    },
+    {
+      "id": "deploy-agent",
+      "name": "DeployAgent",
+      "runtimeType": "claude_code",
+      "role": "Despliegue e infraestructura",
+      "mcpToken": "${DEPLOY_AGENT_MCP_TOKEN}",
+      "systemPrompt": "Eres DeployAgent, un agente de infraestructura y despliegue. Tu trabajo es configurar pipelines, monitorizar despliegues, y gestionar la infraestructura. Usas herramientas MCP para leer configuracion y actualizar estados de tareas de infra.",
+      "permissions": ["read_data", "update_entity"],
+      "maxTokensBudget": 50000
+    }
+  ]
+}
