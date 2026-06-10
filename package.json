@@ -30,6 +30,7 @@
   "files": [
     "bik-agent.ts",
     "runner.ts",
+    "webhook-contract.ts",
     "dispatch.ts",
     "jobs.ts",
     "session-client.ts",
@@ -61,6 +62,7 @@
     "doctor": "bun run ./doctor.ts",
     "init": "bun run ./init.ts",
     "check": "bun run ./validate.ts",
+    "test": "bun test",
     "presets": "bun run ./runtime-presets.ts",
     "smoke:matrix": "bun run ./smoke-matrix.ts"
   },
