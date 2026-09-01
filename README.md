@@ -95,7 +95,7 @@ Optional control-plane env (recommended for robust lifecycle):
 
 ```bash
 export AGENT_RUNNER_URL="http://localhost:3939"
-export RUNNER_SECRET="shared-secret"
+export BIK_AGENT_TOKEN="runner_writer_..." # per-agent runner credential
 export BIK_HEARTBEAT_INTERVAL_MS="10000"
 export BIK_CLAIM_INTERVAL_MS="2000"
 export BIK_CONTROL_CANCEL_POLL_MS="1500"
@@ -107,6 +107,9 @@ export BIK_CONTROL_CANCEL_POLL_MS="1500"
 export WRITER_AGENT_MCP_TOKEN="mcp_wr_xxx"
 export TEST_AGENT_MCP_TOKEN="mcp_te_xxx"
 export DEPLOY_AGENT_MCP_TOKEN="mcp_de_xxx"
+export WRITER_AGENT_RUNNER_TOKEN="runner_wr_xxx"
+export TEST_AGENT_RUNNER_TOKEN="runner_te_xxx"
+export DEPLOY_AGENT_RUNNER_TOKEN="runner_de_xxx"
 export RUNNER_SECRET="shared-secret"
 export RUNNER_ADMIN_TOKEN="admin-token"
 
@@ -253,10 +256,15 @@ SMOKE_RUNTIME_TYPES="claude_code,codex,cursor,openclaw" bun run smoke-matrix.ts
 
 ## Security notes
 
-- Keep `RUNNER_SECRET` and agent MCP tokens in a secret manager.
+- Keep webhook, admin, per-agent runner, and MCP credentials in a secret manager.
+- Terminal session identity is derived from each agent's runner credential. `agentId` in JSON is only an assertion; a mismatch is rejected.
+- Prefer distinct `*_AGENT_RUNNER_TOKEN` values. Falling back to the MCP token exists for migration only.
+- Keep `AGENT_SESSION_AUTH_MODE=agent-token` (the default). `shared-secret` is an explicit legacy compatibility mode, not a production setting.
 - Use `RUNNER_ADMIN_TOKEN` different from `RUNNER_SECRET` in production.
 - Keep `RUNNER_SKIP_PERMISSIONS=false` in production.
 - Restrict network exposure of runner/admin endpoints.
+
+Terminal claims enforce one active job per agent in SQLite. Every claim receives a monotonically increasing `leaseGeneration`; `start`, `complete`, `control`, and active-job heartbeats must present the same owner session and generation before the lease expires. Expiry or restart requeues the job and increments the generation, fencing the old worker.
 
 ---
 

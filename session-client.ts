@@ -16,9 +16,9 @@ type RuntimeType = "claude_code" | "codex" | "cursor" | "opencode" | "kiro" | "o
 type PromptMode = "arg" | "stdin";
 
 const RUNNER_URL = process.env.AGENT_RUNNER_URL ?? "http://localhost:3939";
-const RUNNER_SECRET = process.env.RUNNER_SECRET ?? "";
 const AGENT_ID = process.env.AGENT_ID ?? "";
 const AGENT_MCP_TOKEN = process.env.AGENT_MCP_TOKEN ?? "";
+const AGENT_RUNNER_TOKEN = process.env.BIK_AGENT_TOKEN ?? AGENT_MCP_TOKEN;
 const MCP_SERVER_URL = process.env.MCP_SERVER_URL ?? "https://devapi.biklabs.ai/mcp/sse";
 
 const SESSION_ID = process.env.AGENT_SESSION_ID ?? randomUUID();
@@ -32,9 +32,9 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
 const CODEX_BIN = process.env.CODEX_BIN ?? "codex";
 const CURSOR_BIN = process.env.CURSOR_BIN ?? "cursor-agent";
 
-if (!RUNNER_SECRET) throw new Error("RUNNER_SECRET is required");
 if (!AGENT_ID) throw new Error("AGENT_ID is required");
 if (!AGENT_MCP_TOKEN) throw new Error("AGENT_MCP_TOKEN is required");
+if (!AGENT_RUNNER_TOKEN) throw new Error("BIK_AGENT_TOKEN (or AGENT_MCP_TOKEN fallback) is required");
 if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(AGENT_ID)) {
   throw new Error("AGENT_ID has invalid format (allowed: [a-zA-Z0-9._:-], max 128 chars)");
 }
@@ -50,11 +50,19 @@ if (!Number.isFinite(HTTP_TIMEOUT_MS) || HTTP_TIMEOUT_MS < 1000) {
 
 interface ClaimedJob {
   id: string;
+  leaseGeneration: number;
   taskId: string;
   projectId: string;
   taskTitle?: string | null;
   taskType?: string | null;
 }
+
+interface ActiveLease {
+  jobId: string;
+  leaseGeneration: number;
+}
+
+let activeLease: ActiveLease | null = null;
 
 interface AgentInfo {
   id: string;
@@ -83,7 +91,7 @@ async function runnerPost<T>(path: string, body: unknown): Promise<T> {
       signal: controller.signal,
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${RUNNER_SECRET}`,
+        authorization: `Bearer ${AGENT_RUNNER_TOKEN}`,
       },
       body: JSON.stringify(body),
     });
@@ -266,6 +274,15 @@ async function executeClaimedJob(job: ClaimedJob, agent: AgentInfo): Promise<voi
   let errMessage: string | null = null;
 
   try {
+    // Acquire the running state before starting the runtime. If this lease was
+    // fenced or expired, no unowned agent process is allowed to execute.
+    await runnerPost(`/agent/session/jobs/${job.id}/start`, {
+      sessionId: SESSION_ID,
+      agentId: AGENT_ID,
+      leaseGeneration: job.leaseGeneration,
+      pid: null,
+    });
+
     const { child, promptMode } = spawnRuntime(agent, workdir, prompt);
 
     child.stdout?.on("data", (chunk: Buffer) => process.stdout.write(chunk));
@@ -274,12 +291,6 @@ async function executeClaimedJob(job: ClaimedJob, agent: AgentInfo): Promise<voi
       child.stdin.write(prompt);
       child.stdin.end();
     }
-
-    await runnerPost(`/agent/session/jobs/${job.id}/start`, {
-      sessionId: SESSION_ID,
-      agentId: AGENT_ID,
-      pid: child.pid ?? null,
-    });
 
     exitCode = await new Promise<number | null>((resolve) => {
       child.on("exit", (code) => resolve(code));
@@ -292,9 +303,11 @@ async function executeClaimedJob(job: ClaimedJob, agent: AgentInfo): Promise<voi
     errMessage = err instanceof Error ? err.message : String(err);
     exitCode = 1;
   } finally {
+    activeLease = null;
     await runnerPost(`/agent/session/jobs/${job.id}/complete`, {
       sessionId: SESSION_ID,
       agentId: AGENT_ID,
+      leaseGeneration: job.leaseGeneration,
       exitCode,
       error: errMessage,
       timedOut: false,
@@ -314,11 +327,15 @@ async function executeClaimedJob(job: ClaimedJob, agent: AgentInfo): Promise<voi
 async function heartbeatLoop(): Promise<void> {
   for (;;) {
     try {
+      const lease = activeLease;
       await runnerPost<{ ok: boolean; requeuedWaitingJobs?: number }>("/agent/session/heartbeat", {
         sessionId: SESSION_ID,
         agentId: AGENT_ID,
         label: SESSION_LABEL,
         host: HOST,
+        ...(lease
+          ? { activeJobId: lease.jobId, leaseGeneration: lease.leaseGeneration }
+          : {}),
       });
     } catch (err) {
       process.stderr.write(`\\n[agent-session] heartbeat failed: ${String(err)}\\n`);
@@ -342,7 +359,15 @@ async function claimLoop(): Promise<void> {
         continue;
       }
 
+      if (!Number.isInteger(claimed.job.leaseGeneration) || claimed.job.leaseGeneration < 1) {
+        throw new Error(`runner returned invalid leaseGeneration for job ${claimed.job.id}`);
+      }
+
       process.stdout.write(`\\n[agent-session] claimed job ${claimed.job.id} task=${claimed.job.taskId}\\n`);
+      activeLease = {
+        jobId: claimed.job.id,
+        leaseGeneration: claimed.job.leaseGeneration,
+      };
       await executeClaimedJob(claimed.job, claimed.agent);
     } catch (err) {
       process.stderr.write(`\\n[agent-session] claim loop error: ${String(err)}\\n`);
