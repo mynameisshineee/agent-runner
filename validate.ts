@@ -8,6 +8,7 @@ interface AgentConfig {
   name: string;
   role: string;
   mcpToken: string;
+  runnerToken?: string;
   systemPrompt: string;
   permissions: string[];
   maxTokensBudget: number;
@@ -43,6 +44,9 @@ for (const [idx, a] of data.agents.entries()) {
   assert(typeof a.name === "string" && a.name.length > 0, `agents[${idx}].name is required`);
   assert(typeof a.role === "string" && a.role.length > 0, `agents[${idx}].role is required`);
   assert(typeof a.mcpToken === "string" && a.mcpToken.length > 0, `agents[${idx}].mcpToken is required`);
+  if (typeof a.runnerToken !== "undefined") {
+    assert(typeof a.runnerToken === "string" && a.runnerToken.length > 0, `agents[${idx}].runnerToken invalid`);
+  }
   assert(typeof a.systemPrompt === "string" && a.systemPrompt.length > 0, `agents[${idx}].systemPrompt is required`);
   assert(Array.isArray(a.permissions), `agents[${idx}].permissions must be an array`);
   assert(a.permissions.length > 0, `agents[${idx}].permissions cannot be empty`);

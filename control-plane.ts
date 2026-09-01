@@ -10,6 +10,7 @@ export interface SessionIdentity {
 
 export interface ClaimedControlJob {
   id: string; // control-plane job id
+  leaseGeneration?: number;
   taskId: string;
   projectId: string;
   taskTitle?: string | null;
@@ -81,15 +82,27 @@ async function getJson<T>(url: string, bearer: string, timeoutMs: number): Promi
 
 class RunnerControlPlaneClient implements ControlPlaneClient {
   mode: "runner" = "runner";
+  private activeLease: { jobId: string; leaseGeneration: number } | null = null;
 
   constructor(
     private readonly baseUrl: string,
-    private readonly secret: string,
+    private readonly agentToken: string,
     private readonly timeoutMs: number,
   ) {}
 
   async heartbeat(session: SessionIdentity): Promise<void> {
-    await postJson(`${this.baseUrl}/agent/session/heartbeat`, this.secret, session, this.timeoutMs);
+    const lease = this.activeLease;
+    await postJson(
+      `${this.baseUrl}/agent/session/heartbeat`,
+      this.agentToken,
+      {
+        ...session,
+        ...(lease
+          ? { activeJobId: lease.jobId, leaseGeneration: lease.leaseGeneration }
+          : {}),
+      },
+      this.timeoutMs,
+    );
   }
 
   async claim(session: SessionIdentity): Promise<ClaimedControlJob | null> {
@@ -97,6 +110,7 @@ class RunnerControlPlaneClient implements ControlPlaneClient {
       ok: boolean;
       job: null | {
         id: string;
+        leaseGeneration: number;
         taskId: string;
         projectId: string;
         taskTitle?: string | null;
@@ -106,19 +120,34 @@ class RunnerControlPlaneClient implements ControlPlaneClient {
     };
     const out = await postJson<ClaimResponse>(
       `${this.baseUrl}/agent/session/claim`,
-      this.secret,
+      this.agentToken,
       session,
       this.timeoutMs,
     );
     if (!out.job) return null;
+    if (!Number.isInteger(out.job.leaseGeneration) || out.job.leaseGeneration < 1) {
+      throw new Error(`runner returned invalid leaseGeneration for job ${out.job.id}`);
+    }
+    this.activeLease = {
+      jobId: out.job.id,
+      leaseGeneration: out.job.leaseGeneration,
+    };
     return out.job;
   }
 
+  private leaseGenerationFor(jobId: string): number {
+    if (!this.activeLease || this.activeLease.jobId !== jobId) {
+      throw new Error(`no active lease for runner job ${jobId}`);
+    }
+    return this.activeLease.leaseGeneration;
+  }
+
   async markStart(jobId: string, session: SessionIdentity, pid: number | null): Promise<void> {
+    const leaseGeneration = this.leaseGenerationFor(jobId);
     await postJson(
       `${this.baseUrl}/agent/session/jobs/${jobId}/start`,
-      this.secret,
-      { ...session, pid },
+      this.agentToken,
+      { ...session, leaseGeneration, pid },
       this.timeoutMs,
     );
   }
@@ -128,23 +157,27 @@ class RunnerControlPlaneClient implements ControlPlaneClient {
     session: SessionIdentity,
     result: { exitCode: number | null; timedOut: boolean; error: string | null; summary?: string | null },
   ): Promise<void> {
+    const leaseGeneration = this.leaseGenerationFor(jobId);
     await postJson(
       `${this.baseUrl}/agent/session/jobs/${jobId}/complete`,
-      this.secret,
+      this.agentToken,
       {
         ...session,
+        leaseGeneration,
         ...result,
       },
       this.timeoutMs,
     );
+    this.activeLease = null;
   }
 
   async getControl(jobId: string, session: SessionIdentity): Promise<{ shouldCancel: boolean; status?: string }> {
     type ControlResponse = { ok: boolean; shouldCancel: boolean; status?: string };
+    const leaseGeneration = this.leaseGenerationFor(jobId);
     const out = await postJson<ControlResponse>(
       `${this.baseUrl}/agent/session/jobs/${jobId}/control`,
-      this.secret,
-      session,
+      this.agentToken,
+      { ...session, leaseGeneration },
       this.timeoutMs,
     );
     return { shouldCancel: !!out.shouldCancel, status: out.status };
@@ -153,6 +186,7 @@ class RunnerControlPlaneClient implements ControlPlaneClient {
 
 class GenericControlPlaneClient implements ControlPlaneClient {
   mode: "generic" = "generic";
+  private activeLease: { jobId: string; leaseGeneration: number } | null = null;
 
   constructor(
     private readonly baseUrl: string,
@@ -161,7 +195,18 @@ class GenericControlPlaneClient implements ControlPlaneClient {
   ) {}
 
   async heartbeat(session: SessionIdentity): Promise<void> {
-    await postJson(`${this.baseUrl}/v1/agent-control/sessions/heartbeat`, this.token, session, this.timeoutMs);
+    const lease = this.activeLease;
+    await postJson(
+      `${this.baseUrl}/v1/agent-control/sessions/heartbeat`,
+      this.token,
+      {
+        ...session,
+        ...(lease
+          ? { activeJobId: lease.jobId, leaseGeneration: lease.leaseGeneration }
+          : {}),
+      },
+      this.timeoutMs,
+    );
   }
 
   async claim(session: SessionIdentity): Promise<ClaimedControlJob | null> {
@@ -172,14 +217,23 @@ class GenericControlPlaneClient implements ControlPlaneClient {
       session,
       this.timeoutMs,
     );
+    if (out.job?.leaseGeneration != null) {
+      this.activeLease = {
+        jobId: out.job.id,
+        leaseGeneration: out.job.leaseGeneration,
+      };
+    }
     return out.job ?? null;
   }
 
   async markStart(jobId: string, session: SessionIdentity, pid: number | null): Promise<void> {
+    const leaseGeneration = this.activeLease?.jobId === jobId
+      ? this.activeLease.leaseGeneration
+      : undefined;
     await postJson(
       `${this.baseUrl}/v1/agent-control/jobs/${jobId}/start`,
       this.token,
-      { ...session, pid },
+      { ...session, ...(leaseGeneration == null ? {} : { leaseGeneration }), pid },
       this.timeoutMs,
     );
   }
@@ -189,18 +243,28 @@ class GenericControlPlaneClient implements ControlPlaneClient {
     session: SessionIdentity,
     result: { exitCode: number | null; timedOut: boolean; error: string | null; summary?: string | null },
   ): Promise<void> {
+    const leaseGeneration = this.activeLease?.jobId === jobId
+      ? this.activeLease.leaseGeneration
+      : undefined;
     await postJson(
       `${this.baseUrl}/v1/agent-control/jobs/${jobId}/complete`,
       this.token,
-      { ...session, ...result },
+      { ...session, ...(leaseGeneration == null ? {} : { leaseGeneration }), ...result },
       this.timeoutMs,
     );
+    if (this.activeLease?.jobId === jobId) this.activeLease = null;
   }
 
-  async getControl(jobId: string, _session: SessionIdentity): Promise<{ shouldCancel: boolean; status?: string }> {
+  async getControl(jobId: string, session: SessionIdentity): Promise<{ shouldCancel: boolean; status?: string }> {
     type ControlResponse = { shouldCancel: boolean; status?: string };
+    const url = new URL(`${this.baseUrl}/v1/agent-control/jobs/${jobId}/control`);
+    url.searchParams.set("sessionId", session.sessionId);
+    url.searchParams.set("agentId", session.agentId);
+    if (this.activeLease?.jobId === jobId) {
+      url.searchParams.set("leaseGeneration", String(this.activeLease.leaseGeneration));
+    }
     const out = await getJson<ControlResponse>(
-      `${this.baseUrl}/v1/agent-control/jobs/${jobId}/control`,
+      url.toString(),
       this.token,
       this.timeoutMs,
     );
@@ -212,9 +276,9 @@ export function resolveControlPlaneClient(): ControlPlaneClient | null {
   const timeoutMs = parseInt(process.env.BIK_CONTROL_HTTP_TIMEOUT_MS ?? "10000", 10);
 
   const runnerUrl = process.env.AGENT_RUNNER_URL ?? "";
-  const runnerSecret = process.env.RUNNER_SECRET ?? "";
-  if (runnerUrl && runnerSecret) {
-    return new RunnerControlPlaneClient(runnerUrl.replace(/\/+$/, ""), runnerSecret, timeoutMs);
+  const runnerAgentToken = process.env.BIK_AGENT_TOKEN ?? process.env.AGENT_MCP_TOKEN ?? "";
+  if (runnerUrl && runnerAgentToken) {
+    return new RunnerControlPlaneClient(runnerUrl.replace(/\/+$/, ""), runnerAgentToken, timeoutMs);
   }
 
   const cpUrl = process.env.BIK_CONTROL_PLANE_URL ?? "";
@@ -251,4 +315,3 @@ export async function runHeartbeatLoop(
     await sleep(intervalMs);
   }
 }
-

@@ -143,13 +143,13 @@ async function executeTaskCore(task: TaskLike, binding: ExecutionBinding | null)
       });
     }
 
-    const child = spawnRuntime(runtimeCtx, prompt, workdir, mcpConfigPath, claudeMdPath);
-
     if (binding) {
-      await binding.control.markStart(binding.jobId, binding.session, child.pid ?? null).catch((err) => {
-        logErr(`markStart failed for job ${binding.jobId}: ${String(err)}`);
-      });
+      // Fail closed before the runtime can perform work: a fenced or expired
+      // claim must never leave an unowned process running.
+      await binding.control.markStart(binding.jobId, binding.session, null);
     }
+
+    const child = spawnRuntime(runtimeCtx, prompt, workdir, mcpConfigPath, claudeMdPath);
 
     let stopControlPolling = false;
     const controlPollLoop =

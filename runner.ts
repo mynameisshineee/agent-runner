@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Database } from "bun:sqlite";
 import { normalizeWebhookPayload, fencePromptText } from "./webhook-contract";
@@ -63,6 +63,7 @@ const MAX_ATTEMPTS_DEFAULT = parseInt(process.env.MAX_ATTEMPTS_DEFAULT ?? "3", 1
 const MAX_QUEUE_DEPTH_PER_AGENT = parseInt(process.env.MAX_QUEUE_DEPTH_PER_AGENT ?? "20", 10);
 const RUNNER_EXECUTION_MODE = (process.env.RUNNER_EXECUTION_MODE ?? "spawn") as "spawn" | "terminal";
 const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS ?? "30000", 10);
+const AGENT_SESSION_AUTH_MODE = process.env.AGENT_SESSION_AUTH_MODE ?? "agent-token";
 
 const AGENTS_PATH = join(dirname(fileURLToPath(import.meta.url)), "agents.json");
 
@@ -93,6 +94,7 @@ interface AgentConfig {
   runtimePromptMode?: PromptMode;
   role: string;
   mcpToken: string;
+  runnerToken?: string;
   systemPrompt: string;
   permissions: string[];
   maxTokensBudget: number;
@@ -135,6 +137,8 @@ interface JobRow {
   max_attempts: number;
   next_attempt_at: number;
   lease_until: number | null;
+  lease_generation: number;
+  lease_owner_session_id: string | null;
   run_key: string;
   last_error: string | null;
   created_at: string;
@@ -164,6 +168,10 @@ if (REQUIRE_RUNNER_SECRET && !RUNNER_SECRET) {
   throw new Error(
     "RUNNER_SECRET is required. Set RUNNER_SECRET or set REQUIRE_RUNNER_SECRET=false only for local throwaway dev.",
   );
+}
+
+if (!new Set(["agent-token", "shared-secret"]).has(AGENT_SESSION_AUTH_MODE)) {
+  throw new Error("AGENT_SESSION_AUTH_MODE must be agent-token or shared-secret");
 }
 
 class PermanentJobError extends Error {}
@@ -208,6 +216,8 @@ function initDb(): void {
       max_attempts INTEGER NOT NULL DEFAULT ${MAX_ATTEMPTS_DEFAULT},
       next_attempt_at INTEGER NOT NULL,
       lease_until INTEGER,
+      lease_generation INTEGER NOT NULL DEFAULT 0,
+      lease_owner_session_id TEXT,
       run_key TEXT NOT NULL,
       last_error TEXT,
       created_at TEXT NOT NULL,
@@ -245,14 +255,46 @@ function initDb(): void {
       ON agent_sessions(agent_id, last_seen);
   `);
 
+  const jobColumns = new Set(
+    (db.query("PRAGMA table_info(agent_jobs)").all() as Array<{ name: string }>).map((row) => row.name),
+  );
+  if (!jobColumns.has("lease_generation")) {
+    db.exec("ALTER TABLE agent_jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!jobColumns.has("lease_owner_session_id")) {
+    db.exec("ALTER TABLE agent_jobs ADD COLUMN lease_owner_session_id TEXT");
+  }
+  const duplicateActive = db.query(
+    `
+    SELECT agent_id, COUNT(*) AS count
+    FROM agent_jobs
+    WHERE status IN ('leased','running')
+    GROUP BY agent_id
+    HAVING COUNT(*) > 1
+    LIMIT 1
+  `,
+  ).get() as { agent_id: string; count: number } | null;
+  if (duplicateActive) {
+    throw new Error(
+      `refusing migration: agent ${duplicateActive.agent_id} has ${duplicateActive.count} active jobs`,
+    );
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_jobs_one_active
+    ON agent_jobs(agent_id)
+    WHERE status IN ('leased','running')
+  `);
+
   // Recovery on restart: anything left leased/running is re-queued.
   const t = nowMs();
   const ts = nowIso();
   db.query(
     `
     UPDATE agent_jobs
-    SET status='queued',
+    SET status=CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'queued' END,
         lease_until=NULL,
+        lease_generation=lease_generation + 1,
+        lease_owner_session_id=NULL,
         next_attempt_at=?,
         last_error=COALESCE(last_error, 'runner_restart_recovery'),
         updated_at=?
@@ -270,6 +312,10 @@ function loadAgents(): AgentConfig[] {
   return data.agents.map((agent: AgentConfig) => ({
     ...agent,
     mcpToken: agent.mcpToken.replace(/\$\{(\w+)\}/g, (_, key) => process.env[key] ?? ""),
+    runnerToken: (agent.runnerToken ?? "").replace(
+      /\$\{(\w+)\}/g,
+      (_, key) => process.env[key] ?? "",
+    ) || agent.mcpToken.replace(/\$\{(\w+)\}/g, (_, key) => process.env[key] ?? ""),
   }));
 }
 
@@ -278,13 +324,53 @@ function getAgent(agentId: string): AgentConfig | undefined {
   return agents.find((a) => a.id === agentId);
 }
 
-function isSessionAuthorized(req: Request): boolean {
-  if (!RUNNER_SECRET) return false;
+if (RUNNER_EXECUTION_MODE === "terminal" && AGENT_SESSION_AUTH_MODE === "agent-token") {
+  const configuredTokens = loadAgents().map((agent) => agent.runnerToken ?? "").filter(Boolean);
+  if (configuredTokens.length === 0) {
+    throw new Error("terminal agent-token mode requires at least one resolved agent token");
+  }
+  if (new Set(configuredTokens).size !== configuredTokens.length) {
+    throw new Error("terminal agent-token mode rejects duplicate resolved agent tokens");
+  }
+}
+
+function sessionCredential(req: Request): string {
   const auth = req.headers.get("authorization") ?? "";
   const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  if (AGENT_SESSION_AUTH_MODE === "agent-token") return bearer;
   const direct = req.headers.get("x-runner-secret") ?? "";
-  const provided = bearer || direct;
-  return constantTimeTextEqual(RUNNER_SECRET, provided);
+  return bearer || direct;
+}
+
+type SessionAuthResult =
+  | { ok: true; agent: AgentConfig }
+  | { ok: false; status: 401 | 403; error: string };
+
+function authenticateSessionAgent(req: Request, declaredAgentId?: string): SessionAuthResult {
+  const provided = sessionCredential(req);
+  if (!provided) return { ok: false, status: 401, error: "missing agent credential" };
+
+  if (AGENT_SESSION_AUTH_MODE === "shared-secret") {
+    if (!constantTimeTextEqual(RUNNER_SECRET, provided)) {
+      return { ok: false, status: 401, error: "invalid shared session credential" };
+    }
+    const agent = declaredAgentId ? getAgent(declaredAgentId) : undefined;
+    if (!agent) return { ok: false, status: 403, error: "unknown declared agent" };
+    return { ok: true, agent };
+  }
+
+  const matching = loadAgents().filter(
+    (agent) => agent.runnerToken && constantTimeTextEqual(agent.runnerToken, provided),
+  );
+  if (matching.length !== 1) {
+    return { ok: false, status: 401, error: "invalid or ambiguous agent credential" };
+  }
+
+  const agent = matching[0]!;
+  if (declaredAgentId && declaredAgentId !== agent.id) {
+    return { ok: false, status: 403, error: "agent identity does not match credential" };
+  }
+  return { ok: true, agent };
 }
 
 function cleanupExpiredSessions(): void {
@@ -296,21 +382,21 @@ function upsertSession(
   sessionId: string,
   agentId: string,
   meta?: { label?: string; host?: string; runtimeType?: string },
-): void {
+): boolean {
   const t = nowMs();
   const iso = nowIso();
 
-  db.query(
+  const result = db.query(
     `
     INSERT INTO agent_sessions (id, agent_id, label, host, runtime_type, last_seen, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
-      agent_id=excluded.agent_id,
       label=excluded.label,
       host=excluded.host,
       runtime_type=excluded.runtime_type,
       last_seen=excluded.last_seen,
       updated_at=excluded.updated_at
+    WHERE agent_sessions.agent_id=excluded.agent_id
   `,
   ).run(
     sessionId,
@@ -321,7 +407,8 @@ function upsertSession(
     t,
     iso,
     iso,
-  );
+  ) as { changes?: number };
+  return (result.changes ?? 0) === 1;
 }
 
 function isAgentOnline(agentId: string): boolean {
@@ -412,10 +499,9 @@ function constantTimeHexEqual(expectedHex: string, gotHex: string): boolean {
 
 function constantTimeTextEqual(expected: string, got: string): boolean {
   if (!expected || !got) return false;
-  const expectedBuf = Buffer.from(expected, "utf8");
-  const gotBuf = Buffer.from(got, "utf8");
-  if (expectedBuf.length !== gotBuf.length) return false;
-  return timingSafeEqual(expectedBuf, gotBuf);
+  const expectedDigest = createHash("sha256").update(expected, "utf8").digest();
+  const gotDigest = createHash("sha256").update(got, "utf8").digest();
+  return timingSafeEqual(expectedDigest, gotDigest);
 }
 
 function validateWebhookSignature(req: Request, rawBody: string): { ok: true } | { ok: false; reason: string } {
@@ -657,7 +743,12 @@ function claimNextEligibleJob(): JobRow | null {
     .query(
       `
       UPDATE agent_jobs
-      SET status='leased', lease_until=?, attempts=attempts + 1, updated_at=?
+      SET status='leased',
+          lease_until=?,
+          lease_generation=lease_generation + 1,
+          lease_owner_session_id=NULL,
+          attempts=attempts + 1,
+          updated_at=?
       WHERE id=? AND status='queued'
     `,
     )
@@ -678,43 +769,59 @@ function claimNextEligibleJob(): JobRow | null {
   return leased;
 }
 
-function claimNextJobForAgentSession(agentId: string): JobRow | null {
+function claimNextJobForAgentSession(agentId: string, sessionId: string): JobRow | null {
   const safeAgentId = sanitizeId(agentId, "agentId");
-  const candidate = db
-    .query(
-      `
-      SELECT *
-      FROM agent_jobs
-      WHERE agent_id = ?
-        AND status IN ('queued','waiting_session')
-        AND next_attempt_at <= ?
-      ORDER BY created_at ASC
-      LIMIT 1
-    `,
-    )
-    .get(safeAgentId, nowMs()) as JobRow | null;
-
-  if (!candidate) return null;
-
+  const safeSessionId = sanitizeId(sessionId, "sessionId");
   const leaseUntil = nowMs() + LEASE_MS;
   const claimed = db
     .query(
       `
       UPDATE agent_jobs
-      SET status='leased', lease_until=?, attempts=attempts + 1, updated_at=?
-      WHERE id=? AND status IN ('queued','waiting_session')
+      SET status='leased',
+          lease_until=?,
+          lease_generation=lease_generation + 1,
+          lease_owner_session_id=?,
+          attempts=attempts + 1,
+          last_error=NULL,
+          updated_at=?
+      WHERE id = (
+        SELECT candidate.id
+        FROM agent_jobs candidate
+        WHERE candidate.agent_id = ?
+          AND candidate.status IN ('queued','waiting_session')
+          AND candidate.attempts < candidate.max_attempts
+          AND candidate.next_attempt_at <= ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM agent_jobs active
+            WHERE active.agent_id = candidate.agent_id
+              AND active.status IN ('leased','running')
+          )
+        ORDER BY candidate.created_at ASC
+        LIMIT 1
+      )
+        AND status IN ('queued','waiting_session')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM agent_jobs active
+          WHERE active.agent_id = agent_jobs.agent_id
+            AND active.status IN ('leased','running')
+        )
+      RETURNING *
     `,
     )
-    .run(leaseUntil, nowIso(), candidate.id) as { changes?: number };
+    .get(leaseUntil, safeSessionId, nowIso(), safeAgentId, nowMs()) as JobRow | null;
 
-  if ((claimed.changes ?? 0) !== 1) return null;
+  if (!claimed) return null;
 
-  logJobEvent(candidate.id, "job.leased", {
+  logJobEvent(claimed.id, "job.leased", {
     leaseUntil,
+    leaseGeneration: claimed.lease_generation,
+    ownerSessionId: safeSessionId,
     via: "terminal_session",
   });
 
-  return getJobById(candidate.id);
+  return claimed;
 }
 
 function markJobRunning(jobId: string): boolean {
@@ -744,6 +851,98 @@ function markJobCompleted(jobId: string): boolean {
   if ((result.changes ?? 0) !== 1) return false;
   logJobEvent(jobId, "job.completed");
   return true;
+}
+
+function markTerminalJobRunning(
+  jobId: string,
+  agentId: string,
+  sessionId: string,
+  leaseGeneration: number,
+): boolean {
+  const result = db.query(
+    `
+    UPDATE agent_jobs
+    SET status='running',
+        lease_until=?,
+        last_error=NULL,
+        updated_at=?
+    WHERE id=?
+      AND agent_id=?
+      AND status='leased'
+      AND lease_owner_session_id=?
+      AND lease_generation=?
+      AND lease_until IS NOT NULL
+      AND lease_until >= ?
+  `,
+  ).run(
+    nowMs() + LEASE_MS,
+    nowIso(),
+    jobId,
+    agentId,
+    sessionId,
+    leaseGeneration,
+    nowMs(),
+  ) as { changes?: number };
+  if ((result.changes ?? 0) !== 1) return false;
+  logJobEvent(jobId, "job.running", { sessionId, leaseGeneration, via: "terminal_session" });
+  return true;
+}
+
+function markTerminalJobCompleted(
+  jobId: string,
+  agentId: string,
+  sessionId: string,
+  leaseGeneration: number,
+): boolean {
+  const result = db.query(
+    `
+    UPDATE agent_jobs
+    SET status='completed',
+        lease_until=NULL,
+        lease_owner_session_id=NULL,
+        updated_at=?
+    WHERE id=?
+      AND agent_id=?
+      AND status='running'
+      AND lease_owner_session_id=?
+      AND lease_generation=?
+      AND lease_until IS NOT NULL
+      AND lease_until >= ?
+  `,
+  ).run(nowIso(), jobId, agentId, sessionId, leaseGeneration, nowMs()) as { changes?: number };
+  if ((result.changes ?? 0) !== 1) return false;
+  logJobEvent(jobId, "job.completed", { sessionId, leaseGeneration, via: "terminal_session" });
+  return true;
+}
+
+function renewTerminalLease(
+  jobId: string,
+  agentId: string,
+  sessionId: string,
+  leaseGeneration: number,
+): boolean {
+  const result = db.query(
+    `
+    UPDATE agent_jobs
+    SET lease_until=?, updated_at=?
+    WHERE id=?
+      AND agent_id=?
+      AND status IN ('leased','running')
+      AND lease_owner_session_id=?
+      AND lease_generation=?
+      AND lease_until IS NOT NULL
+      AND lease_until >= ?
+  `,
+  ).run(
+    nowMs() + LEASE_MS,
+    nowIso(),
+    jobId,
+    agentId,
+    sessionId,
+    leaseGeneration,
+    nowMs(),
+  ) as { changes?: number };
+  return (result.changes ?? 0) === 1;
 }
 
 function markJobCancelled(jobId: string, reason: string): boolean {
@@ -795,6 +994,8 @@ function retryJobNow(jobId: string): { ok: true } | { ok: false; status: number;
     SET status='queued',
         attempts=0,
         lease_until=NULL,
+        lease_owner_session_id=NULL,
+        lease_generation=lease_generation + 1,
         next_attempt_at=?,
         last_error=NULL,
         updated_at=?
@@ -902,33 +1103,108 @@ function markJobFailedWithRetry(jobId: string, reason: string, timedOut = false)
   });
 }
 
-function recoverStaleLeases(): void {
-  const stale = db
-    .query(
-      `
-      SELECT id
-      FROM agent_jobs
-      WHERE status='leased' AND lease_until IS NOT NULL AND lease_until < ?
-    `,
-    )
-    .all(nowMs()) as Array<{ id: string }>;
+function markTerminalJobFailedWithRetry(
+  jobId: string,
+  agentId: string,
+  sessionId: string,
+  leaseGeneration: number,
+  reason: string,
+  timedOut = false,
+): boolean {
+  const job = db.query(
+    `
+    SELECT attempts, max_attempts
+    FROM agent_jobs
+    WHERE id=?
+      AND agent_id=?
+      AND status IN ('leased','running')
+      AND lease_owner_session_id=?
+      AND lease_generation=?
+      AND lease_until IS NOT NULL
+      AND lease_until >= ?
+  `,
+  ).get(jobId, agentId, sessionId, leaseGeneration, nowMs()) as
+    | { attempts: number; max_attempts: number }
+    | null;
+  if (!job) return false;
 
-  const t = nowMs();
-  const ts = nowIso();
-  db.query(
+  const terminal = job.attempts >= job.max_attempts;
+  const nextAttemptAt = terminal ? nowMs() : nowMs() + backoffMsForAttempt(job.attempts);
+  const status = terminal ? "dead_letter" : "queued";
+  const lastError = terminal
+    ? reason
+    : `${timedOut ? "timed_out" : "failed"}: ${reason}`;
+  const result = db.query(
     `
     UPDATE agent_jobs
-    SET status='queued',
+    SET status=?,
         lease_until=NULL,
+        lease_owner_session_id=NULL,
+        lease_generation=lease_generation + 1,
+        last_error=?,
+        next_attempt_at=?,
+        updated_at=?
+    WHERE id=?
+      AND agent_id=?
+      AND status IN ('leased','running')
+      AND lease_owner_session_id=?
+      AND lease_generation=?
+      AND lease_until IS NOT NULL
+      AND lease_until >= ?
+  `,
+  ).run(
+    status,
+    lastError,
+    nextAttemptAt,
+    nowIso(),
+    jobId,
+    agentId,
+    sessionId,
+    leaseGeneration,
+    nowMs(),
+  ) as { changes?: number };
+  if ((result.changes ?? 0) !== 1) return false;
+  logJobEvent(jobId, terminal ? "job.dead_letter" : "job.requeued", {
+    reason,
+    timedOut,
+    attempts: job.attempts,
+    maxAttempts: job.max_attempts,
+    nextAttemptAt,
+    sessionId,
+    leaseGeneration,
+    via: "terminal_session",
+  });
+  return true;
+}
+
+function recoverStaleLeases(): void {
+  const t = nowMs();
+  const ts = nowIso();
+  const stale = db.query(
+    `
+    UPDATE agent_jobs
+    SET status=CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'queued' END,
+        lease_until=NULL,
+        lease_owner_session_id=NULL,
+        lease_generation=lease_generation + 1,
         next_attempt_at=?,
         updated_at=?,
         last_error=COALESCE(last_error, 'lease_expired_recovery')
-    WHERE status='leased' AND lease_until IS NOT NULL AND lease_until < ?
+    WHERE (
+        status='leased'
+        OR (status='running' AND lease_owner_session_id IS NOT NULL)
+      )
+      AND lease_until IS NOT NULL
+      AND lease_until < ?
+    RETURNING id, lease_generation, status
   `,
-  ).run(t, ts, t);
+  ).all(t, ts, t) as Array<{ id: string; lease_generation: number; status: JobStatus }>;
 
   for (const row of stale) {
-    logJobEvent(row.id, "job.recovered_stale_lease");
+    logJobEvent(row.id, row.status === "dead_letter" ? "job.dead_letter" : "job.recovered_stale_lease", {
+      leaseGeneration: row.lease_generation,
+      reason: "lease_expired_recovery",
+    });
   }
 }
 
@@ -1463,16 +1739,14 @@ const server = Bun.serve({
     }
 
     if (url.pathname === "/agent/session/heartbeat" && req.method === "POST") {
-      if (!isSessionAuthorized(req)) {
-        return safeJsonResponse({ error: "unauthorized" }, { status: 401 });
-      }
-
       type SessionHeartbeatPayload = {
         sessionId: string;
         agentId: string;
         label?: string;
         host?: string;
         runtimeType?: string;
+        activeJobId?: string;
+        leaseGeneration?: number;
       };
 
       let body: SessionHeartbeatPayload;
@@ -1485,31 +1759,62 @@ const server = Bun.serve({
       try {
         sanitizeId(body.sessionId, "sessionId");
         sanitizeId(body.agentId, "agentId");
+        if (body.activeJobId) sanitizeId(body.activeJobId, "activeJobId");
       } catch (err) {
         return safeJsonResponse({ error: String(err) }, { status: 400 });
       }
 
-      upsertSession(body.sessionId, body.agentId, {
+      const auth = authenticateSessionAgent(req, body.agentId);
+      if (!auth.ok) return safeJsonResponse({ error: auth.error }, { status: auth.status });
+      const agentId = auth.agent.id;
+
+      const hasActiveJob = body.activeJobId !== undefined;
+      const hasGeneration = body.leaseGeneration !== undefined;
+      if (hasActiveJob !== hasGeneration) {
+        return safeJsonResponse(
+          { error: "activeJobId and leaseGeneration must be provided together" },
+          { status: 400 },
+        );
+      }
+      if (hasGeneration && (!Number.isInteger(body.leaseGeneration) || body.leaseGeneration! < 1)) {
+        return safeJsonResponse({ error: "invalid leaseGeneration" }, { status: 400 });
+      }
+
+      if (!upsertSession(body.sessionId, agentId, {
         label: body.label,
         host: body.host,
         runtimeType: body.runtimeType,
-      });
+      })) {
+        return safeJsonResponse({ error: "session id belongs to another agent" }, { status: 409 });
+      }
 
-      const requeued = requeueWaitingJobsForAgent(body.agentId);
+      let leaseRenewed: boolean | null = null;
+      if (body.activeJobId && body.leaseGeneration !== undefined) {
+        leaseRenewed = renewTerminalLease(
+          body.activeJobId,
+          agentId,
+          body.sessionId,
+          body.leaseGeneration,
+        );
+        if (!leaseRenewed) {
+          return safeJsonResponse({ error: "fenced_lease", sessionAlive: true }, { status: 409 });
+        }
+      }
+
+      const requeued = requeueWaitingJobsForAgent(agentId);
 
       return safeJsonResponse({
         ok: true,
         mode: RUNNER_EXECUTION_MODE,
         requeuedWaitingJobs: requeued,
-        online: isAgentOnline(body.agentId),
+        online: isAgentOnline(agentId),
+        sessionAlive: true,
+        leaseRenewed,
         sessionTtlMs: SESSION_TTL_MS,
       });
     }
 
     if (url.pathname === "/agent/session/claim" && req.method === "POST") {
-      if (!isSessionAuthorized(req)) {
-        return safeJsonResponse({ error: "unauthorized" }, { status: 401 });
-      }
       if (RUNNER_EXECUTION_MODE !== "terminal") {
         return safeJsonResponse({ error: "session claim disabled in spawn mode" }, { status: 409 });
       }
@@ -1536,23 +1841,23 @@ const server = Bun.serve({
         return safeJsonResponse({ error: String(err) }, { status: 400 });
       }
 
-      upsertSession(body.sessionId, body.agentId, {
+      const auth = authenticateSessionAgent(req, body.agentId);
+      if (!auth.ok) return safeJsonResponse({ error: auth.error }, { status: auth.status });
+      const agent = auth.agent;
+
+      if (!upsertSession(body.sessionId, agent.id, {
         label: body.label,
         host: body.host,
         runtimeType: body.runtimeType,
-      });
-
-      requeueWaitingJobsForAgent(body.agentId);
-
-      const job = claimNextJobForAgentSession(body.agentId);
-      if (!job) {
-        return safeJsonResponse({ ok: true, job: null });
+      })) {
+        return safeJsonResponse({ error: "session id belongs to another agent" }, { status: 409 });
       }
 
-      const agent = getAgent(body.agentId);
-      if (!agent) {
-        markJobDeadLetter(job.id, `agent not found on claim: ${body.agentId}`);
-        return safeJsonResponse({ ok: false, error: "agent not found" }, { status: 404 });
+      requeueWaitingJobsForAgent(agent.id);
+
+      const job = claimNextJobForAgentSession(agent.id, body.sessionId);
+      if (!job) {
+        return safeJsonResponse({ ok: true, job: null });
       }
 
       return safeJsonResponse({
@@ -1565,6 +1870,8 @@ const server = Bun.serve({
           taskType: job.task_type,
           attempts: job.attempts,
           maxAttempts: job.max_attempts,
+          leaseGeneration: job.lease_generation,
+          leaseUntil: job.lease_until,
           payload: JSON.parse(job.payload_json),
         },
         agent: {
@@ -1585,11 +1892,7 @@ const server = Bun.serve({
 
     const sessionStartMatch = url.pathname.match(/^\/agent\/session\/jobs\/([a-f0-9-]+)\/start$/i);
     if (sessionStartMatch && req.method === "POST") {
-      if (!isSessionAuthorized(req)) {
-        return safeJsonResponse({ error: "unauthorized" }, { status: 401 });
-      }
-
-      type SessionStartPayload = { sessionId: string; agentId: string; pid?: number };
+      type SessionStartPayload = { sessionId: string; agentId: string; leaseGeneration: number; pid?: number };
       let body: SessionStartPayload;
       try {
         body = (await req.json()) as SessionStartPayload;
@@ -1600,26 +1903,27 @@ const server = Bun.serve({
       try {
         sanitizeId(body.sessionId, "sessionId");
         sanitizeId(body.agentId, "agentId");
+        if (!Number.isInteger(body.leaseGeneration) || body.leaseGeneration < 1) {
+          throw new Error("invalid leaseGeneration");
+        }
       } catch (err) {
         return safeJsonResponse({ error: String(err) }, { status: 400 });
       }
 
+      const auth = authenticateSessionAgent(req, body.agentId);
+      if (!auth.ok) return safeJsonResponse({ error: auth.error }, { status: auth.status });
+
       const jobId = sessionStartMatch[1] ?? "";
       const job = getJobById(jobId);
       if (!job) return safeJsonResponse({ error: "job not found" }, { status: 404 });
-      if (job.agent_id !== body.agentId) {
-        return safeJsonResponse({ error: "agent mismatch" }, { status: 403 });
-      }
-      if (job.status !== "leased") {
-        return safeJsonResponse({ error: `job not leased (status=${job.status})` }, { status: 409 });
-      }
 
-      if (!markJobRunning(jobId)) {
-        return safeJsonResponse({ error: "state transition failed: leased->running" }, { status: 409 });
+      if (!markTerminalJobRunning(jobId, auth.agent.id, body.sessionId, body.leaseGeneration)) {
+        return safeJsonResponse({ error: "fenced_lease" }, { status: 409 });
       }
       logJobEvent(jobId, "runtime.started_terminal", {
         sessionId: body.sessionId,
-        agentId: body.agentId,
+        agentId: auth.agent.id,
+        leaseGeneration: body.leaseGeneration,
         pid: body.pid ?? null,
       });
       return safeJsonResponse({ ok: true, jobId });
@@ -1627,13 +1931,10 @@ const server = Bun.serve({
 
     const sessionCompleteMatch = url.pathname.match(/^\/agent\/session\/jobs\/([a-f0-9-]+)\/complete$/i);
     if (sessionCompleteMatch && req.method === "POST") {
-      if (!isSessionAuthorized(req)) {
-        return safeJsonResponse({ error: "unauthorized" }, { status: 401 });
-      }
-
       type SessionCompletePayload = {
         sessionId: string;
         agentId: string;
+        leaseGeneration: number;
         exitCode?: number | null;
         timedOut?: boolean;
         error?: string | null;
@@ -1649,42 +1950,43 @@ const server = Bun.serve({
       try {
         sanitizeId(body.sessionId, "sessionId");
         sanitizeId(body.agentId, "agentId");
+        if (!Number.isInteger(body.leaseGeneration) || body.leaseGeneration < 1) {
+          throw new Error("invalid leaseGeneration");
+        }
       } catch (err) {
         return safeJsonResponse({ error: String(err) }, { status: 400 });
       }
 
+      const auth = authenticateSessionAgent(req, body.agentId);
+      if (!auth.ok) return safeJsonResponse({ error: auth.error }, { status: auth.status });
+
       const jobId = sessionCompleteMatch[1] ?? "";
       const job = getJobById(jobId);
       if (!job) return safeJsonResponse({ error: "job not found" }, { status: 404 });
-      if (job.agent_id !== body.agentId) {
-        return safeJsonResponse({ error: "agent mismatch" }, { status: 403 });
-      }
       if (job.status === "cancelled") {
-        logJobEvent(jobId, "runtime.completed_terminal_after_cancel", {
-          sessionId: body.sessionId,
-          agentId: body.agentId,
-          exitCode: body.exitCode ?? null,
-          timedOut: !!body.timedOut,
-          summary: body.summary ?? null,
-          error: body.error ?? null,
-        });
-        return safeJsonResponse({ ok: true, jobId, alreadyCancelled: true });
-      }
-      if (!["running", "leased"].includes(job.status)) {
-        return safeJsonResponse({ error: `job not active (status=${job.status})` }, { status: 409 });
+        return safeJsonResponse({ error: "job_cancelled" }, { status: 409 });
       }
 
       const ok = (body.exitCode ?? 1) === 0 && !body.error && !body.timedOut;
       if (ok) {
-        if (!markJobCompleted(jobId)) {
-          return safeJsonResponse({ error: "state transition failed: active->completed" }, { status: 409 });
+        if (!markTerminalJobCompleted(jobId, auth.agent.id, body.sessionId, body.leaseGeneration)) {
+          return safeJsonResponse({ error: "fenced_lease" }, { status: 409 });
         }
       } else {
-        markJobFailedWithRetry(jobId, body.error ?? `exit_code=${String(body.exitCode ?? "unknown")}`, !!body.timedOut);
+        const failed = markTerminalJobFailedWithRetry(
+          jobId,
+          auth.agent.id,
+          body.sessionId,
+          body.leaseGeneration,
+          body.error ?? `exit_code=${String(body.exitCode ?? "unknown")}`,
+          !!body.timedOut,
+        );
+        if (!failed) return safeJsonResponse({ error: "fenced_lease" }, { status: 409 });
       }
       logJobEvent(jobId, "runtime.completed_terminal", {
         sessionId: body.sessionId,
-        agentId: body.agentId,
+        agentId: auth.agent.id,
+        leaseGeneration: body.leaseGeneration,
         exitCode: body.exitCode ?? null,
         timedOut: !!body.timedOut,
         summary: body.summary ?? null,
@@ -1695,11 +1997,7 @@ const server = Bun.serve({
 
     const sessionControlMatch = url.pathname.match(/^\/agent\/session\/jobs\/([a-f0-9-]+)\/control$/i);
     if (sessionControlMatch && req.method === "POST") {
-      if (!isSessionAuthorized(req)) {
-        return safeJsonResponse({ error: "unauthorized" }, { status: 401 });
-      }
-
-      type SessionControlPayload = { sessionId: string; agentId: string };
+      type SessionControlPayload = { sessionId: string; agentId: string; leaseGeneration: number };
       let body: SessionControlPayload;
       try {
         body = (await req.json()) as SessionControlPayload;
@@ -1710,15 +2008,28 @@ const server = Bun.serve({
       try {
         sanitizeId(body.sessionId, "sessionId");
         sanitizeId(body.agentId, "agentId");
+        if (!Number.isInteger(body.leaseGeneration) || body.leaseGeneration < 1) {
+          throw new Error("invalid leaseGeneration");
+        }
       } catch (err) {
         return safeJsonResponse({ error: String(err) }, { status: 400 });
       }
 
+      const auth = authenticateSessionAgent(req, body.agentId);
+      if (!auth.ok) return safeJsonResponse({ error: auth.error }, { status: auth.status });
+
       const jobId = sessionControlMatch[1] ?? "";
       const job = getJobById(jobId);
       if (!job) return safeJsonResponse({ error: "job not found" }, { status: 404 });
-      if (job.agent_id !== body.agentId) {
-        return safeJsonResponse({ error: "agent mismatch" }, { status: 403 });
+      if (
+        job.agent_id !== auth.agent.id
+        || job.lease_owner_session_id !== body.sessionId
+        || job.lease_generation !== body.leaseGeneration
+      ) {
+        return safeJsonResponse({ error: "fenced_lease" }, { status: 409 });
+      }
+      if (job.status !== "cancelled" && (job.lease_until === null || job.lease_until < nowMs())) {
+        return safeJsonResponse({ error: "fenced_lease" }, { status: 409 });
       }
 
       const status = job.status;

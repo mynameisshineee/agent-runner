@@ -12,15 +12,17 @@
 - Webhook must require signed headers (`X-BIK-Timestamp`, `X-BIK-Event-Id`, `X-BIK-Signature`).
 - Signature must bind **timestamp + eventId + body**.
 - Secrets are never accepted in JSON body.
-- Admin/session auth must use bearer token and constant-time comparison.
+- Admin auth must use bearer token and constant-time comparison.
+- Session identity must be derived from a unique per-agent runner token; a body `agentId` mismatch is `403`.
 
 2. **Durability gate**
 - Assignment accepted only after durable insert into `agent_jobs`.
-- Worker restarts must recover `leased/running` jobs to `queued`.
-- Stale leases must be automatically recovered.
+- Worker restarts must recover `leased/running` jobs and increment their lease generation.
+- Stale terminal `leased/running` jobs must be automatically recovered and old generations fenced.
 
 3. **Correctness gate**
-- Job transitions are conditional (`leased -> running`, `running|leased -> completed`).
+- Terminal job transitions are conditional (`leased -> running`, `running -> completed`) on agent, owner session, generation, and an unexpired lease.
+- A partial unique index must enforce at most one `leased|running` job per agent.
 - Duplicate active execution for same `run_key` (`agentId:taskId`) is rejected.
 - Idempotency by `event_id` is enforced.
 
@@ -31,6 +33,7 @@
 5. **Terminal-first gate**
 - In `RUNNER_EXECUTION_MODE=terminal`, offline agent must produce `waiting_session`.
 - Session heartbeat requeues waiting work when agent comes online.
+- An active-job heartbeat renews only the matching owner/generation and never revives an expired lease.
 - Session client must execute in visible TTY and report start/complete explicitly.
 
 ---
@@ -45,11 +48,12 @@
 - Accept valid signed request (`202`).
 
 ## `/agent/session/*`
-- Must require session auth.
+- Must require a per-agent runner credential in the default mode.
 - Must validate `sessionId` and `agentId` format.
 - `claim` only enabled in terminal mode.
 - `start` requires job in `leased`.
-- `complete` requires job in `running|leased`.
+- successful `complete` requires job in `running`.
+- `start`, `complete`, and `control` require the current `leaseGeneration` and owner session.
 
 ---
 
@@ -57,6 +61,8 @@
 
 - [ ] `RUNNER_SECRET` set and rotated.
 - [ ] `RUNNER_ADMIN_TOKEN` separate from `RUNNER_SECRET` in production.
+- [ ] Per-agent runner tokens are unique, non-empty, rotated, and separate from MCP tokens.
+- [ ] `AGENT_SESSION_AUTH_MODE=agent-token`.
 - [ ] `RUNNER_SKIP_PERMISSIONS=false` in production.
 - [ ] Log scrubber policy ensures no MCP token appears in logs.
 - [ ] Runtime hosts run with least privilege filesystem/network.
@@ -88,5 +94,5 @@ Release is **GO** only if:
 - Typecheck passes.
 - Security gate + durability gate pass in smoke environment.
 - One full terminal-mode flow is validated end-to-end with event timeline.
+- The black-box fencing test passes identity spoof, 20-way claim race, WIP=1, expiry, heartbeat, and restart arms.
 - CTO signoff on queue backend and token rotation policy.
-
